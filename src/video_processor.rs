@@ -226,7 +226,7 @@ impl VideoProcessor {
                 
                 if processing_frames % 25 == 0 || processing_frames == 1 {
                     let total_progress = frame_count as f32 / total_frames as f32 * 100.0;
-                    println!("⚡ Processing: {:.1}% ({}/{}) - {} frames processed", 
+                    println!("Processing: {:.1}% ({}/{}) - {} frames processed", 
                             total_progress, frame_count + 1, total_frames, processing_frames);
                 }
             }
@@ -235,7 +235,7 @@ impl VideoProcessor {
 
             if frame_count % cleanup_interval == 0 {
                 self.model.cleanup_codewords();
-                println!("🧹 Cleaned up stale codewords at frame {}", frame_count);
+                println!("Cleaned up stale codewords at frame {}", frame_count);
             }
         }
 
@@ -366,7 +366,7 @@ impl VideoProcessor {
 
             if frame_count % cleanup_interval == 0 {
                 self.model.cleanup_codewords();
-                println!("🧹 Cleaned up stale codewords");
+                println!("Cleaned up stale codewords");
             }
         }
 
