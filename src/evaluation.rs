@@ -325,6 +325,8 @@ impl EvaluationMetrics {
         } else {
             0.0
         };
+
+        // Calculate temporal stability
         let temporal_stability = if segmentation_results.len() < 2 {
             1.0
         } else {
