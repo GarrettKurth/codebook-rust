@@ -354,7 +354,7 @@ impl EvaluationMetrics {
             true_positive_rate,
             false_positive_rate,
             temporal_consistency: Some(temporal_consistency),
-            temporal_stability: None,
+            temporal_stability: Some(temporal_stability),
             avg_foreground_ratio: Some(avg_foreground_ratio),
         }
     }
