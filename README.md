@@ -1,6 +1,6 @@
 # codebook-rust
 
-Rust implmentation of the Codebook algorithm for foreground-background segmentation in images and videos as proposed by Kim et al. in [Real-Time Foreground–Background Segmentation Using Codebook Model](https://ieeexplore.ieee.org/document/1643681).
+Rust implmentation of the Codebook algorithm for foreground-background segmentation in images and videos as proposed by Kim et al. in [Real-Time Foreground–Background Segmentation Using Codebook Model](https://www.sciencedirect.com/science/article/abs/pii/S1077201405000057).
 
 ## Features
 - Foreground-background segmentation using the Codebook algorithm
