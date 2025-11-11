@@ -261,6 +261,177 @@ impl CodebookModel {
             current_time: self.current_time,
         }
     }
+    /// Set new parameters for the model without changing learned codebooks
+    /// Useful for parameter sweep testing
+    ///
+    /// # Arguments
+    /// * `alpha` - New alpha parameter (lower bound brightness factor)
+    /// * `beta` - New beta parameter (upper bound brightness factor)
+    /// * `epsilon` - New epsilon parameter (color distortion threshold)
+    /// * `lambda` - New lambda parameter (maximum time without access)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use codebook_model::codebook::CodebookModel;
+    /// let mut model = CodebookModel::load_from_file("learned.cbm").unwrap();
+    /// model.set_params(0.5, 1.2, 15.0, 150);
+    /// // Model now uses new parameters but keeps learned codebooks
+    /// ```
+    pub fn set_params(&mut self, alpha: f32, beta: f32, epsilon: f32, lambda: u32) {
+        self.alpha = alpha;
+        self.beta = beta;
+        self.epsilon = epsilon;
+        self.lambda = lambda as f32;
+    }
+    /// Classify a single pixel at a specific position as foreground (true) or background (false)
+    /// without updating model state. Used for parameter sweep evaluation.
+    ///
+    /// # Arguments
+    /// * `pixel` - Pixel values (can be 1-channel grayscale or 3-channel RGB/BGR)
+    /// * `pixel_idx` - Linear index of pixel position (y * width + x)
+    ///
+    /// # Returns
+    /// * `bool` - true if foreground, false if background
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use codebook_model::codebook::CodebookModel;
+    /// # use ndarray::Array1;
+    /// let model = CodebookModel::load_from_file("learned.cbm").unwrap();
+    /// let pixel = Array1::from_vec(vec![128.0]); // Grayscale value
+    /// let is_foreground = model.classify_pixel_at(&pixel, 0);
+    /// ```
+    pub fn classify_pixel_at(&self, pixel: &Array1<f32>, pixel_idx: usize) -> bool {
+        // Convert single channel to RGB if needed (grayscale input)
+        let pixel_rgb = if pixel.len() == 1 {
+            Array1::from_vec(vec![pixel[0], pixel[0], pixel[0]])
+        } else if pixel.len() == 3 {
+            // Assume BGR input, convert to RGB
+            Array1::from_vec(vec![pixel[2], pixel[1], pixel[0]])
+        } else {
+            return true; // Unknown format, default to foreground
+        };
+
+        if pixel_idx >= self.codebooks.len() {
+            return true; // Default to foreground if invalid index
+        }
+
+        let codebook = &self.codebooks[pixel_idx];
+        let pixel_i = pixel_rgb.sum();
+
+        // Check if pixel matches any codeword (background)
+        for codeword in codebook.iter() {
+            // Brightness check
+            if !(codeword.i_min as f32 * self.alpha <= pixel_i
+                && pixel_i <= codeword.i_max as f32 * self.beta)
+            {
+                continue;
+            }
+
+            // Color distortion check
+            let mut dist = 0.0;
+            for j in 0..3 {
+                let pw = pixel_rgb[j];
+                let cw_min = codeword.rgb_min[j];
+                let cw_max = codeword.rgb_max[j];
+                if pw < cw_min {
+                    dist += (cw_min - pw).powi(2);
+                } else if pw > cw_max {
+                    dist += (pw - cw_max).powi(2);
+                }
+            }
+            let distortion = dist.sqrt();
+
+            if distortion <= self.epsilon {
+                return false; // Background (match found)
+            }
+        }
+
+        true // Foreground (no match found)
+    }
+
+    /// Classify an entire frame without updating the model
+    /// Useful for testing and evaluation
+    ///
+    /// # Arguments
+    /// * `frame` - Frame as a vector of pixels (same format as learning/detection)
+    ///
+    /// # Returns
+    /// * `Vec<bool>` - Foreground mask (true = foreground, false = background)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use codebook_model::codebook::CodebookModel;
+    /// # use ndarray::Array1;
+    /// let model = CodebookModel::load_from_file("learned.cbm").unwrap();
+    /// let frame: Vec<Array1<f32>> = vec![]; // Your frame data
+    /// let mask = model.classify_frame(&frame);
+    /// ```
+    pub fn classify_frame(&self, frame: &Vec<Array1<f32>>) -> Vec<bool> {
+        let frame_rgb = Self::bgr_to_rgb(frame);
+        let mut foreground_mask = vec![false; self.width * self.height];
+
+        for (idx, pixel) in frame_rgb.iter().enumerate() {
+            if idx >= self.codebooks.len() {
+                break;
+            }
+
+            let codebook = &self.codebooks[idx];
+            let pixel_i = pixel.sum();
+            let mut is_background = false;
+
+            // Check if pixel matches any codeword
+            for codeword in codebook.iter() {
+                // Brightness check
+                if !(codeword.i_min as f32 * self.alpha <= pixel_i
+                    && pixel_i <= codeword.i_max as f32 * self.beta)
+                {
+                    continue;
+                }
+
+                // Color distortion check
+                let mut dist = 0.0;
+                for j in 0..3 {
+                    let pw = pixel[j];
+                    let cw_min = codeword.rgb_min[j];
+                    let cw_max = codeword.rgb_max[j];
+                    if pw < cw_min {
+                        dist += (cw_min - pw).powi(2);
+                    } else if pw > cw_max {
+                        dist += (pw - cw_max).powi(2);
+                    }
+                }
+                let distortion = dist.sqrt();
+
+                if distortion <= self.epsilon {
+                    is_background = true;
+                    break;
+                }
+            }
+
+            foreground_mask[idx] = !is_background;
+        }
+
+        foreground_mask
+    }
+
+    /// Get statistics about the learned codebooks
+    ///
+    /// # Returns
+    /// * `(total_codewords, avg_codewords_per_pixel, max_codewords, min_codewords)`
+    pub fn get_codebook_stats(&self) -> (usize, f32, usize, usize) {
+        let total: usize = self.codebooks.iter().map(|cb| cb.len()).sum();
+        let count = self.codebooks.len();
+        let avg = if count > 0 {
+            total as f32 / count as f32
+        } else {
+            0.0
+        };
+        let max = self.codebooks.iter().map(|cb| cb.len()).max().unwrap_or(0);
+        let min = self.codebooks.iter().map(|cb| cb.len()).min().unwrap_or(0);
+
+        (total, avg, max, min)
+    }
 }
 
 impl fmt::Display for CodebookModel {
@@ -278,4 +449,3 @@ impl fmt::Display for CodebookModel {
         )
     }
 }
-

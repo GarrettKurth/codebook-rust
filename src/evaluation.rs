@@ -3,8 +3,12 @@ use ndarray::Array2;
 use opencv::{
     core::{self, CV_8UC1, CV_8UC3, Mat, MatExprTraitConst},
     prelude::*,
+    videoio,
 };
+
 use serde::{Deserialize, Serialize};
+
+use crate::CodebookModel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
@@ -737,4 +741,223 @@ fn mat_to_array1_vec(
     }
 
     result
+}
+
+/// Configuration for parameter sweep evaluation
+#[derive(Debug, Clone)]
+pub struct ParameterSweepConfig {
+    pub alpha_values: Vec<f32>,
+    pub beta_values: Vec<f32>,
+    pub epsilon_values: Vec<f32>,
+    pub lambda_values: Vec<f32>,
+}
+
+impl Default for ParameterSweepConfig {
+    fn default() -> Self {
+        ParameterSweepConfig {
+            alpha_values: vec![0.3, 0.4, 0.5, 0.6],
+            beta_values: vec![1.0, 1.1, 1.2, 1.3],
+            epsilon_values: vec![5.0, 10.0, 15.0, 20.0],
+            lambda_values: vec![50.0, 100.0, 150.0, 200.0],
+        }
+    }
+}
+
+/// Perform parameter sweep evaluation on a pre-trained codebook
+///
+/// # Arguments
+/// * `base_model` - Pre-trained codebook model (loaded from file)
+/// * `video_path` - Path to video file
+/// * `config` - Parameter sweep configuration
+/// * `truth_masks` - Optional ground truth masks for evaluation
+///
+/// # Returns
+/// * `Vec<ParameterTestResult>` - Results for all parameter combinations
+pub fn parameter_sweep(
+    base_model: &CodebookModel,
+    video_path: &str,
+    config: &ParameterSweepConfig,
+    truth_masks: Option<&[Vec<bool>]>,
+) -> Result<Vec<ParameterTestResult>, Box<dyn std::error::Error>> {
+    let mut results = Vec::new();
+    let total_combinations = config.alpha_values.len()
+        * config.beta_values.len()
+        * config.epsilon_values.len()
+        * config.lambda_values.len();
+
+    println!("Testing {} parameter combinations...", total_combinations);
+
+    // Open video to get dimensions
+    let mut video = videoio::VideoCapture::from_file(video_path, videoio::CAP_ANY)?;
+    if !video.is_opened()? {
+        return Err("Failed to open video".into());
+    }
+
+    let width = video.get(videoio::CAP_PROP_FRAME_WIDTH)? as usize;
+    let height = video.get(videoio::CAP_PROP_FRAME_HEIGHT)? as usize;
+    let frame_count = video.get(videoio::CAP_PROP_FRAME_COUNT)? as usize;
+
+    // Pre-load all frames for reuse across parameter combinations
+    println!("Loading {} frames...", frame_count);
+    let mut frames = Vec::new();
+    video.set(videoio::CAP_PROP_POS_FRAMES, 0.0)?;
+
+    for _ in 0..frame_count {
+        let mut frame = Mat::default();
+        if !video.read(&mut frame)? || frame.empty() {
+            break;
+        }
+
+        // Convert to grayscale Array2<u8>
+        let mut gray = Mat::default();
+        opencv::imgproc::cvt_color(
+            &frame,
+            &mut gray,
+            opencv::imgproc::COLOR_BGR2GRAY,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+
+        let mut array_frame = Array2::zeros((height, width));
+        for row in 0..height {
+            for col in 0..width {
+                let pixel = gray.at_2d::<u8>(row as i32, col as i32)?;
+                array_frame[[row, col]] = *pixel;
+            }
+        }
+        frames.push(array_frame);
+    }
+
+    println!("Loaded {} frames", frames.len());
+
+    let mut count = 0;
+
+    for &alpha in &config.alpha_values {
+        for &beta in &config.beta_values {
+            for &epsilon in &config.epsilon_values {
+                for &lambda in &config.lambda_values {
+                    count += 1;
+                    println!(
+                        "Testing combination {}/{}: alpha={}, beta={}, epsilon={}, lambda={}",
+                        count, total_combinations, alpha, beta, epsilon, lambda
+                    );
+
+                    let start_time = std::time::Instant::now();
+
+                    // Create model with new parameters (no re-learning!)
+                    let mut test_model = base_model.clone();
+                    test_model.set_params(alpha, beta, epsilon, lambda as u32);
+
+                    // Perform segmentation with new parameters
+                    let mut seg_results = Vec::new();
+                    for frame in &frames {
+                        // Convert Array2 to pixel vector
+                        let pixels: Vec<Array1<f32>> = frame
+                            .iter()
+                            .map(|&val| Array1::from_vec(vec![val as f32]))
+                            .collect();
+
+                        // Classify each pixel with its position
+                        let mask: Vec<bool> = pixels
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, pixel)| test_model.classify_pixel_at(pixel, idx))
+                            .collect();
+
+                        seg_results.push(mask);
+                    }
+
+                    // Use compute_quality_evaluation to get full metrics
+                    let truth = truth_masks.unwrap_or(&[]);
+                    let quality_eval =
+                        compute_quality_evaluation(&seg_results, truth, &frames, width, height);
+
+                    let processing_time = start_time.elapsed().as_secs_f64();
+
+                    results.push(ParameterTestResult {
+                        parameters: ModelParameters {
+                            lambda: lambda as u32,
+                            alpha,
+                            beta,
+                            epsilon,
+                        },
+                        segmentation_quality: SegmentationQuality {
+                            avg_connected_components: quality_eval.structural_quality.num_components
+                                as f32,
+                            avg_component_size: quality_eval.structural_quality.avg_component_size,
+                            fragmentation_score: quality_eval.fragmentation_score,
+                        },
+                        temporal_consistency: quality_eval.temporal_consistency.unwrap_or(0.0),
+                        avg_foreground_ratio: quality_eval.avg_foreground_ratio.unwrap_or(0.0),
+                        processing_time,
+                        quality_evaluation: quality_eval,
+                    });
+
+                    println!(
+                        "  F1: {:.3}, Temporal: {:.3}, Fragmentation: {:.3}, Overall: {:.3}",
+                        results.last().unwrap().quality_evaluation.f1_score,
+                        results.last().unwrap().temporal_consistency,
+                        results
+                            .last()
+                            .unwrap()
+                            .segmentation_quality
+                            .fragmentation_score,
+                        results.last().unwrap().quality_evaluation.overall_score
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Updated ParameterTestResult to include full quality evaluation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterTestResult {
+    pub parameters: ModelParameters,
+    pub segmentation_quality: SegmentationQuality,
+    pub temporal_consistency: f32,
+    pub avg_foreground_ratio: f32,
+    pub processing_time: f64,
+    pub quality_evaluation: QualityEvaluation,
+}
+/// Find the best parameter combination based on a composite score
+///
+/// # Arguments
+/// * `results` - Results from parameter sweep
+/// * `weights` - Weights for (temporal_consistency, segmentation_quality, foreground_ratio)
+///
+/// # Returns
+/// * `Option<&ParameterTestResult>` - Best result or None if results empty
+pub fn find_best_parameters(
+    results: &[ParameterTestResult],
+    weights: (f32, f32, f32),
+) -> Option<&ParameterTestResult> {
+    let (w_temporal, w_segmentation, w_foreground) = weights;
+
+    results.iter().max_by(|a, b| {
+        // Composite score: lower fragmentation is better, higher temporal consistency is better
+        let score_a = w_temporal * a.temporal_consistency
+            - w_segmentation * a.segmentation_quality.fragmentation_score
+            + w_foreground * a.avg_foreground_ratio;
+
+        let score_b = w_temporal * b.temporal_consistency
+            - w_segmentation * b.segmentation_quality.fragmentation_score
+            + w_foreground * b.avg_foreground_ratio;
+
+        score_a
+            .partial_cmp(&score_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// Save parameter sweep results to a JSON file
+pub fn save_sweep_results<P: AsRef<std::path::Path>>(
+    results: &[ParameterTestResult],
+    path: P,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    serde_json::to_writer_pretty(file, results)?;
+    Ok(())
 }
