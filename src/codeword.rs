@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 pub struct Codeword {
     pub rgb_min: Array1<f32>,
     pub rgb_max: Array1<f32>,
-    pub i_min: u8,
-    pub i_max: u8,
+    pub i_min: f32,
+    pub i_max: f32,
     pub frequency: u32,
     pub lambda: u32,
     pub first_access: u32,
@@ -27,7 +27,7 @@ pub struct Codeword {
 impl Codeword {
     /// Create a new codeword from a pixel observation
     pub fn new(pixel: &Array1<f32>, current_time: u32) -> Self {
-        let pixel_i = pixel.sum() as u8;
+        let pixel_i = pixel.sum();
 
         Codeword {
             rgb_min: pixel.clone(),
@@ -42,7 +42,7 @@ impl Codeword {
     }
     /// Update codeword statistics with new pixel observation
     pub fn update(&mut self, pixel: &Array1<f32>, current_time: u32) {
-        let pixel_i = pixel.sum() as u8;
+        let pixel_i = pixel.sum();
 
         // Update RGB bounds
         for i in 0..3 {

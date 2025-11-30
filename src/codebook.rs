@@ -60,8 +60,8 @@ impl CodebookModel {
                 for (i, codeword) in codebook.iter().enumerate() {
                     // Brightness check
                     let pixel_i = pixel.sum();
-                    if !(codeword.i_min as f32 * self.alpha <= pixel_i
-                        && pixel_i <= codeword.i_max as f32 * self.beta)
+                    if !(codeword.i_min * self.alpha <= pixel_i
+                        && pixel_i <= codeword.i_max * self.beta)
                     {
                         continue;
                     }
@@ -112,8 +112,8 @@ impl CodebookModel {
             for codeword in codebook.iter_mut() {
                 let pixel_i = pixel.sum();
                 // Brightness check
-                if !(codeword.i_min as f32 * self.alpha <= pixel_i
-                    && pixel_i <= codeword.i_max as f32 * self.beta)
+                if !(codeword.i_min * self.alpha <= pixel_i
+                    && pixel_i <= codeword.i_max * self.beta)
                 {
                     continue;
                 }
@@ -134,17 +134,12 @@ impl CodebookModel {
 
                 if distortion <= self.epsilon {
                     is_background = true;
-                    codeword.last_access = self.current_time;
+                    codeword.update(pixel, self.current_time);
                     break;
                 }
             }
 
             foreground_mask[idx] = !is_background;
-        }
-
-        // Remove stale codewords
-        for codebook in self.codebooks.iter_mut() {
-            codebook.retain(|cw| (self.current_time - cw.last_access) as f32 <= self.lambda);
         }
 
         foreground_mask
@@ -155,7 +150,7 @@ impl CodebookModel {
         for codebook in self.codebooks.iter_mut() {
             codebook.retain(|codeword| {
                 let time_since_access = self.current_time - codeword.last_access;
-                time_since_access <= self.lambda as u32
+                    (time_since_access as f32) <= self.lambda
             });
         }
     }
@@ -383,8 +378,8 @@ impl CodebookModel {
             // Check if pixel matches any codeword
             for codeword in codebook.iter() {
                 // Brightness check
-                if !(codeword.i_min as f32 * self.alpha <= pixel_i
-                    && pixel_i <= codeword.i_max as f32 * self.beta)
+                if !(codeword.i_min * self.alpha <= pixel_i
+                    && pixel_i <= codeword.i_max * self.beta)
                 {
                     continue;
                 }
