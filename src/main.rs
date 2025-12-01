@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::fs;
 use anyhow::{Result, Context};
-use codebook_model::{CodebookModel, VideoProcessor};
+use codebook_model::{
+    evaluation::{self, ParameterSweepConfig},
+    CodebookModel,
+    VideoProcessor,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -74,6 +79,49 @@ enum Commands {
         #[arg(long, default_value_t = 10.0)]
         epsilon: f32,
     },
+
+    /// Run a parameter sweep evaluation against a learned codebook
+    Evaluate {
+        /// Path to a serialized codebook (.cbm or .json)
+        #[arg(long)]
+        codebook: PathBuf,
+
+        /// Input video path used for evaluation
+        #[arg(long)]
+        video: PathBuf,
+
+        /// Output JSON file to store sweep results
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Optional folder containing ground-truth masks
+        #[arg(long)]
+        truth_masks: Option<PathBuf>,
+
+        /// Override alpha sweep values (comma separated)
+        #[arg(long)]
+        alpha_values: Option<String>,
+
+        /// Override beta sweep values (comma separated)
+        #[arg(long)]
+        beta_values: Option<String>,
+
+        /// Override epsilon sweep values (comma separated)
+        #[arg(long)]
+        epsilon_values: Option<String>,
+
+        /// Override lambda sweep values (comma separated)
+        #[arg(long)]
+        lambda_values: Option<String>,
+
+        /// Sample only every Nth frame when evaluating
+        #[arg(long, default_value_t = 1)]
+        frame_stride: usize,
+
+        /// Maximum number of frames to sample (after stride)
+        #[arg(long)]
+        max_frames: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -115,6 +163,29 @@ fn main() -> Result<()> {
             beta,
             lambda,
             epsilon,
+        ),
+        Commands::Evaluate {
+            codebook,
+            video,
+            output,
+            truth_masks,
+            alpha_values,
+            beta_values,
+            epsilon_values,
+            lambda_values,
+            frame_stride,
+            max_frames,
+        } => run_evaluation_command(
+            codebook,
+            video,
+            output,
+            truth_masks,
+            alpha_values,
+            beta_values,
+            epsilon_values,
+            lambda_values,
+            frame_stride,
+            max_frames,
         ),
     }
 }
@@ -276,6 +347,135 @@ fn process_folder(
     }
 
     Ok(())
+}
+
+fn run_evaluation_command(
+    codebook_path: PathBuf,
+    video_path: PathBuf,
+    output_path: PathBuf,
+    truth_masks: Option<PathBuf>,
+    alpha_values: Option<String>,
+    beta_values: Option<String>,
+    epsilon_values: Option<String>,
+    lambda_values: Option<String>,
+    frame_stride: usize,
+    max_frames: Option<usize>,
+) -> Result<()> {
+    let mut config = ParameterSweepConfig::default();
+
+    if let Some(overrides) = parse_value_list(alpha_values, "alpha")? {
+        config.alpha_values = overrides;
+    }
+    if let Some(overrides) = parse_value_list(beta_values, "beta")? {
+        config.beta_values = overrides;
+    }
+    if let Some(overrides) = parse_value_list(epsilon_values, "epsilon")? {
+        config.epsilon_values = overrides;
+    }
+    if let Some(overrides) = parse_value_list(lambda_values, "lambda")? {
+        config.lambda_values = overrides;
+    }
+
+    config.frame_stride = frame_stride.max(1);
+    config.max_frames = max_frames;
+
+    let base_model = load_codebook_from_path(&codebook_path)?;
+
+    let (width, height) = get_video_dimensions(&video_path, None, None)?;
+
+    let truth_data = if let Some(mask_path) = truth_masks {
+        Some(
+            evaluation::load_truth_masks_from_folder(
+                mask_path,
+                width,
+                height,
+                config.frame_stride,
+                config.max_frames,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let video_str = video_path
+        .to_str()
+        .context("Video path contains invalid UTF-8")?;
+
+    let sweep_results = evaluation::parameter_sweep(
+        &base_model,
+        video_str,
+        &config,
+        truth_data.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create output directory {}", parent.display())
+            })?;
+        }
+    }
+
+    evaluation::save_sweep_results(&sweep_results, &output_path)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if let Some(best) = evaluation::find_best_parameters(&sweep_results, (0.5, 1.0, 0.3)) {
+        println!(
+            "Best candidate -> alpha {:.3}, beta {:.3}, epsilon {:.3}, lambda {:.1}, F1 {:.3}",
+            best.parameters.alpha,
+            best.parameters.beta,
+            best.parameters.epsilon,
+            best.parameters.lambda,
+            best.quality_evaluation.f1_score
+        );
+    }
+
+    println!(
+        "Saved {} sweep entries to {}",
+        sweep_results.len(),
+        output_path.display()
+    );
+
+    Ok(())
+}
+
+fn parse_value_list(arg: Option<String>, label: &str) -> Result<Option<Vec<f32>>> {
+    if let Some(raw) = arg {
+        let mut values = Vec::new();
+        for token in raw.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: f32 = trimmed.parse().with_context(|| {
+                format!(
+                    "Invalid {} value '{}'. Expected comma-separated floats.",
+                    label, trimmed
+                )
+            })?;
+            values.push(value);
+        }
+        return Ok(if values.is_empty() { None } else { Some(values) });
+    }
+    Ok(None)
+}
+
+fn load_codebook_from_path(path: &PathBuf) -> Result<CodebookModel> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .unwrap_or_else(|| "".to_string());
+
+    if extension == "json" {
+        CodebookModel::load_from_json(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load JSON codebook: {}", e))
+    } else {
+        CodebookModel::load_from_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load binary codebook: {}", e))
+    }
 }
 
 fn get_image_dimensions(folder: &PathBuf) -> Result<(usize, usize)> {

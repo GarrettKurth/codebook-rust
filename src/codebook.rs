@@ -272,11 +272,11 @@ impl CodebookModel {
     /// model.set_params(0.5, 1.2, 15.0, 150);
     /// // Model now uses new parameters but keeps learned codebooks
     /// ```
-    pub fn set_params(&mut self, alpha: f32, beta: f32, epsilon: f32, lambda: u32) {
+    pub fn set_params(&mut self, alpha: f32, beta: f32, epsilon: f32, lambda: f32) {
         self.alpha = alpha;
         self.beta = beta;
         self.epsilon = epsilon;
-        self.lambda = lambda as f32;
+        self.lambda = lambda;
     }
     /// Classify a single pixel at a specific position as foreground (true) or background (false)
     /// without updating model state. Used for parameter sweep evaluation.
@@ -343,6 +343,43 @@ impl CodebookModel {
         }
 
         true // Foreground (no match found)
+    }
+
+    /// Classify a grayscale value quickly without allocating RGB buffers.
+    pub fn classify_grayscale_at(&self, value: f32, pixel_idx: usize) -> bool {
+        if pixel_idx >= self.codebooks.len() {
+            return true;
+        }
+
+        let codebook = &self.codebooks[pixel_idx];
+        let pixel_i = value * 3.0; // matches grayscale → RGB conversion logic
+        let rgb = [value, value, value];
+
+        for codeword in codebook.iter() {
+            if !(codeword.i_min * self.alpha <= pixel_i
+                && pixel_i <= codeword.i_max * self.beta)
+            {
+                continue;
+            }
+
+            let mut dist = 0.0;
+            for j in 0..3 {
+                let pw = rgb[j];
+                let cw_min = codeword.rgb_min[j];
+                let cw_max = codeword.rgb_max[j];
+                if pw < cw_min {
+                    dist += (cw_min - pw).powi(2);
+                } else if pw > cw_max {
+                    dist += (pw - cw_max).powi(2);
+                }
+            }
+
+            if dist.sqrt() <= self.epsilon {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Classify an entire frame without updating the model

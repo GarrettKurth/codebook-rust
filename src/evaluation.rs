@@ -1,4 +1,3 @@
-use ndarray::Array1;
 use ndarray::Array2;
 use opencv::{
     core::{self, CV_8UC1, CV_8UC3, Mat, MatExprTraitConst},
@@ -7,8 +6,60 @@ use opencv::{
 };
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::CodebookModel;
+
+#[derive(Debug)]
+pub enum EvaluationError {
+    DimensionMismatch {
+        expected: usize,
+        actual: usize,
+        context: &'static str,
+    },
+    FrameCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    EmptyInput(&'static str),
+    Io(String),
+    OpenCv(String),
+}
+
+impl std::fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluationError::DimensionMismatch {
+                expected,
+                actual,
+                context,
+            } => write!(
+                f,
+                "Dimension mismatch (context: {}): expected {}, got {}",
+                context, expected, actual
+            ),
+            EvaluationError::FrameCountMismatch { expected, actual } => write!(
+                f,
+                "Frame count mismatch: expected {}, got {}",
+                expected, actual
+            ),
+            EvaluationError::EmptyInput(ctx) => write!(f, "No data provided for {}", ctx),
+            EvaluationError::Io(msg) => write!(f, "I/O error: {}", msg),
+            EvaluationError::OpenCv(msg) => write!(f, "OpenCV error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for EvaluationError {}
+
+impl From<opencv::Error> for EvaluationError {
+    fn from(value: opencv::Error) -> Self {
+        EvaluationError::OpenCv(value.message)
+    }
+}
+
+pub type EvaluationResult<T> = Result<T, EvaluationError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
@@ -19,7 +70,7 @@ pub struct VideoInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelParameters {
-    pub lambda: u32,
+    pub lambda: f32,
     pub alpha: f32,
     pub beta: f32,
     pub epsilon: f32,
@@ -66,6 +117,86 @@ pub struct SegmentationQuality {
     pub avg_connected_components: f32,
     pub avg_component_size: f32,
     pub fragmentation_score: f32,
+}
+
+pub fn load_truth_masks_from_folder<P: AsRef<Path>>(
+    folder: P,
+    width: usize,
+    height: usize,
+    frame_stride: usize,
+    max_frames: Option<usize>,
+) -> EvaluationResult<Vec<Vec<bool>>> {
+    let path = folder.as_ref();
+    if !path.exists() {
+        return Err(EvaluationError::Io(format!(
+            "Ground-truth folder does not exist: {}",
+            path.display()
+        )));
+    }
+
+    let mut files: Vec<PathBuf> = fs::read_dir(path)
+        .map_err(|e| EvaluationError::Io(e.to_string()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|entry| entry.is_file())
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        return Err(EvaluationError::EmptyInput("truth masks"));
+    }
+
+    let stride = frame_stride.max(1);
+    let mut masks = Vec::new();
+    let mut source_index = 0usize;
+
+    for file in files {
+        if source_index % stride != 0 {
+            source_index += 1;
+            continue;
+        }
+
+        if let Some(limit) = max_frames {
+            if masks.len() >= limit {
+                break;
+            }
+        }
+
+        let file_str = file
+            .to_str()
+            .ok_or_else(|| EvaluationError::Io("Invalid UTF-8 in mask path".to_string()))?;
+
+        let mask_img = opencv::imgcodecs::imread(file_str, opencv::imgcodecs::IMREAD_GRAYSCALE)
+            .map_err(EvaluationError::from)?;
+
+        if mask_img.cols() as usize != width || mask_img.rows() as usize != height {
+            return Err(EvaluationError::DimensionMismatch {
+                expected: width * height,
+                actual: (mask_img.cols() * mask_img.rows()) as usize,
+                context: "truth mask dimensions",
+            });
+        }
+
+        let mut mask = Vec::with_capacity(width * height);
+        for row in 0..height {
+            for col in 0..width {
+                let pixel = *mask_img
+                    .at_2d::<u8>(row as i32, col as i32)
+                    .map_err(EvaluationError::from)?;
+                mask.push(pixel > 0);
+            }
+        }
+
+        masks.push(mask);
+        source_index += 1;
+    }
+
+    if masks.is_empty() {
+        return Err(EvaluationError::EmptyInput(
+            "truth masks after applying stride/max_frames",
+        ));
+    }
+
+    Ok(masks)
 }
 
 pub fn calculate_spatial_coherence(
@@ -481,13 +612,60 @@ pub fn compute_quality_evaluation(
     frames: &[Array2<u8>],
     width: usize,
     height: usize,
-) -> QualityEvaluation {
-    // Compute accuracy metrics
+) -> EvaluationResult<QualityEvaluation> {
+    if segmentation_results.is_empty() {
+        return Err(EvaluationError::EmptyInput("segmentation results"));
+    }
 
-    let frame_count = segmentation_results
-        .len()
-        .min(truth_masks.len())
-        .min(frames.len());
+    let expected_pixels = width * height;
+    for mask in segmentation_results {
+        if mask.len() != expected_pixels {
+            return Err(EvaluationError::DimensionMismatch {
+                expected: expected_pixels,
+                actual: mask.len(),
+                context: "segmentation mask",
+            });
+        }
+    }
+
+    if !truth_masks.is_empty() {
+        if truth_masks.len() != segmentation_results.len() {
+            return Err(EvaluationError::FrameCountMismatch {
+                expected: segmentation_results.len(),
+                actual: truth_masks.len(),
+            });
+        }
+
+        for mask in truth_masks {
+            if mask.len() != expected_pixels {
+                return Err(EvaluationError::DimensionMismatch {
+                    expected: expected_pixels,
+                    actual: mask.len(),
+                    context: "truth mask",
+                });
+            }
+        }
+    }
+
+    if frames.len() != segmentation_results.len() {
+        return Err(EvaluationError::FrameCountMismatch {
+            expected: segmentation_results.len(),
+            actual: frames.len(),
+        });
+    }
+
+    for frame in frames {
+        let (rows, cols) = frame.dim();
+        if rows != height || cols != width {
+            return Err(EvaluationError::DimensionMismatch {
+                expected: expected_pixels,
+                actual: rows * cols,
+                context: "frame dimensions",
+            });
+        }
+    }
+
+    let frame_count = segmentation_results.len();
 
     let (
         precision,
@@ -587,7 +765,7 @@ pub fn compute_quality_evaluation(
     };
 
     // Average foreground ratio
-    let total_pixels: usize = segmentation_results.iter().map(|m| m.len()).sum();
+    let total_pixels: usize = expected_pixels * frame_count;
     let foreground_pixels: usize = segmentation_results
         .iter()
         .map(|m| m.iter().filter(|&&b| b).count())
@@ -617,17 +795,11 @@ pub fn compute_quality_evaluation(
     };
 
     // Spatial coherence: average over all frames/masks
-    let spatial_coherence = if !segmentation_results.is_empty()
-        && frames.len() == segmentation_results.len()
-    {
-        let mut sum = 0.0;
-        for i in 0..frame_count {
-            sum += calculate_spatial_coherence(&frames[i], &segmentation_results[i], width, height);
-        }
-        sum / frame_count as f32
-    } else {
-        0.0
-    };
+    let mut spatial_sum = 0.0;
+    for i in 0..frame_count {
+        spatial_sum += calculate_spatial_coherence(&frames[i], &segmentation_results[i], width, height);
+    }
+    let spatial_coherence = spatial_sum / frame_count as f32;
 
     // Flicker rate
     let flicker_rate = calculate_flicker_rate(segmentation_results, width, height);
@@ -672,17 +844,11 @@ pub fn compute_quality_evaluation(
     };
 
     // Superpixel purity: average over all frames/masks
-    let superpixel_purity = if !segmentation_results.is_empty()
-        && frames.len() == segmentation_results.len()
-    {
-        let mut sum = 0.0;
-        for i in 0..frame_count {
-            sum += calculate_superpixel_purity(&frames[i], &segmentation_results[i], width, height);
-        }
-        sum / frame_count as f32
-    } else {
-        0.0
-    };
+    let mut purity_sum = 0.0;
+    for i in 0..frame_count {
+        purity_sum += calculate_superpixel_purity(&frames[i], &segmentation_results[i], width, height);
+    }
+    let superpixel_purity = purity_sum / frame_count as f32;
 
     // Overall score (simple average of main metrics, can be customized)
     let overall_score = (f1_score
@@ -692,7 +858,7 @@ pub fn compute_quality_evaluation(
         + superpixel_purity)
         / 5.0;
 
-    QualityEvaluation {
+    Ok(QualityEvaluation {
         precision,
         recall,
         f1_score,
@@ -709,38 +875,7 @@ pub fn compute_quality_evaluation(
         superpixel_purity,
         structural_quality,
         overall_score,
-    }
-}
-fn mat_to_array1_vec(
-    frame: &opencv::prelude::Mat,
-) -> Vec<ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 1]>>> {
-    use opencv::prelude::*;
-
-    let rows = frame.rows();
-    let cols = frame.cols();
-    let channels = frame.channels();
-
-    let mut result = Vec::with_capacity((rows * cols) as usize);
-
-    // Convert Mat to Vec<Array1<f32>>
-    for row in 0..rows {
-        for col in 0..cols {
-            let mut pixel_data = vec![0.0f32; channels as usize];
-
-            // Extract pixel values for all channels
-            for ch in 0..channels {
-                let pixel_value = frame
-                    .at_2d::<opencv::core::Vec3b>(row, col)
-                    .map(|pixel| pixel[ch as usize] as f32)
-                    .unwrap_or(0.0);
-                pixel_data[ch as usize] = pixel_value;
-            }
-
-            result.push(Array1::from_vec(pixel_data));
-        }
-    }
-
-    result
+    })
 }
 
 /// Configuration for parameter sweep evaluation
@@ -750,6 +885,8 @@ pub struct ParameterSweepConfig {
     pub beta_values: Vec<f32>,
     pub epsilon_values: Vec<f32>,
     pub lambda_values: Vec<f32>,
+    pub frame_stride: usize,
+    pub max_frames: Option<usize>,
 }
 
 impl Default for ParameterSweepConfig {
@@ -759,6 +896,8 @@ impl Default for ParameterSweepConfig {
             beta_values: vec![1.0, 1.1, 1.2, 1.3],
             epsilon_values: vec![5.0, 10.0, 15.0, 20.0],
             lambda_values: vec![50.0, 100.0, 150.0, 200.0],
+            frame_stride: 1,
+            max_frames: None,
         }
     }
 }
@@ -778,7 +917,7 @@ pub fn parameter_sweep(
     video_path: &str,
     config: &ParameterSweepConfig,
     truth_masks: Option<&[Vec<bool>]>,
-) -> Result<Vec<ParameterTestResult>, Box<dyn std::error::Error>> {
+) -> EvaluationResult<Vec<ParameterTestResult>> {
     let mut results = Vec::new();
     let total_combinations = config.alpha_values.len()
         * config.beta_values.len()
@@ -787,28 +926,42 @@ pub fn parameter_sweep(
 
     println!("Testing {} parameter combinations...", total_combinations);
 
-    // Open video to get dimensions
     let mut video = videoio::VideoCapture::from_file(video_path, videoio::CAP_ANY)?;
     if !video.is_opened()? {
-        return Err("Failed to open video".into());
+        return Err(EvaluationError::Io(format!(
+            "Failed to open video: {}",
+            video_path
+        )));
     }
 
     let width = video.get(videoio::CAP_PROP_FRAME_WIDTH)? as usize;
     let height = video.get(videoio::CAP_PROP_FRAME_HEIGHT)? as usize;
-    let frame_count = video.get(videoio::CAP_PROP_FRAME_COUNT)? as usize;
+    let expected_pixels = width * height;
 
-    // Pre-load all frames for reuse across parameter combinations
-    println!("Loading {} frames...", frame_count);
-    let mut frames = Vec::new();
+    let stride = config.frame_stride.max(1);
+    let mut sampled_frames = Vec::new();
+    let mut flattened_frames: Vec<Vec<f32>> = Vec::new();
+    let mut frame_index = 0usize;
+
     video.set(videoio::CAP_PROP_POS_FRAMES, 0.0)?;
 
-    for _ in 0..frame_count {
+    loop {
         let mut frame = Mat::default();
         if !video.read(&mut frame)? || frame.empty() {
             break;
         }
 
-        // Convert to grayscale Array2<u8>
+        if frame_index % stride != 0 {
+            frame_index += 1;
+            continue;
+        }
+
+        if let Some(limit) = config.max_frames {
+            if sampled_frames.len() >= limit {
+                break;
+            }
+        }
+
         let mut gray = Mat::default();
         opencv::imgproc::cvt_color(
             &frame,
@@ -819,16 +972,44 @@ pub fn parameter_sweep(
         )?;
 
         let mut array_frame = Array2::zeros((height, width));
+        let mut flattened = Vec::with_capacity(expected_pixels);
         for row in 0..height {
             for col in 0..width {
                 let pixel = gray.at_2d::<u8>(row as i32, col as i32)?;
+                let value = *pixel as f32;
                 array_frame[[row, col]] = *pixel;
+                flattened.push(value);
             }
         }
-        frames.push(array_frame);
+
+        sampled_frames.push(array_frame);
+        flattened_frames.push(flattened);
+        frame_index += 1;
     }
 
-    println!("Loaded {} frames", frames.len());
+    if sampled_frames.is_empty() {
+        return Err(EvaluationError::EmptyInput("video frames"));
+    }
+
+    if let Some(truth) = truth_masks {
+        if truth.len() != sampled_frames.len() {
+            return Err(EvaluationError::FrameCountMismatch {
+                expected: sampled_frames.len(),
+                actual: truth.len(),
+            });
+        }
+        for mask in truth {
+            if mask.len() != expected_pixels {
+                return Err(EvaluationError::DimensionMismatch {
+                    expected: expected_pixels,
+                    actual: mask.len(),
+                    context: "truth mask",
+                });
+            }
+        }
+    }
+
+    println!("Loaded {} sampled frames", sampled_frames.len());
 
     let mut count = 0;
 
@@ -844,39 +1025,33 @@ pub fn parameter_sweep(
 
                     let start_time = std::time::Instant::now();
 
-                    // Create model with new parameters (no re-learning!)
                     let mut test_model = base_model.clone();
-                    test_model.set_params(alpha, beta, epsilon, lambda as u32);
+                    test_model.set_params(alpha, beta, epsilon, lambda);
 
-                    // Perform segmentation with new parameters
-                    let mut seg_results = Vec::new();
-                    for frame in &frames {
-                        // Convert Array2 to pixel vector
-                        let pixels: Vec<Array1<f32>> = frame
-                            .iter()
-                            .map(|&val| Array1::from_vec(vec![val as f32]))
-                            .collect();
-
-                        // Classify each pixel with its position
-                        let mask: Vec<bool> = pixels
+                    let mut seg_results = Vec::with_capacity(sampled_frames.len());
+                    for frame_values in &flattened_frames {
+                        let mask: Vec<bool> = frame_values
                             .iter()
                             .enumerate()
-                            .map(|(idx, pixel)| test_model.classify_pixel_at(pixel, idx))
+                            .map(|(idx, &val)| test_model.classify_grayscale_at(val, idx))
                             .collect();
-
                         seg_results.push(mask);
                     }
 
-                    // Use compute_quality_evaluation to get full metrics
                     let truth = truth_masks.unwrap_or(&[]);
-                    let quality_eval =
-                        compute_quality_evaluation(&seg_results, truth, &frames, width, height);
+                    let quality_eval = compute_quality_evaluation(
+                        &seg_results,
+                        truth,
+                        &sampled_frames,
+                        width,
+                        height,
+                    )?;
 
                     let processing_time = start_time.elapsed().as_secs_f64();
 
                     results.push(ParameterTestResult {
                         parameters: ModelParameters {
-                            lambda: lambda as u32,
+                            lambda,
                             alpha,
                             beta,
                             epsilon,
