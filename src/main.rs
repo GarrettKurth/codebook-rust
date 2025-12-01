@@ -47,6 +47,10 @@ enum Commands {
         /// Epsilon parameter (color distortion threshold)
         #[arg(long, default_value_t = 10.0)]
         epsilon: f32,
+
+        /// Optional path to persist the learned codebook (.cbm or .json)
+        #[arg(long, value_name = "PATH")]
+        save_codebook: Option<PathBuf>,
     },
 
     /// Process folder of individual frame images (PNG, JPG, BMP)
@@ -78,6 +82,10 @@ enum Commands {
         /// Epsilon parameter (color distortion threshold)
         #[arg(long, default_value_t = 10.0)]
         epsilon: f32,
+
+        /// Optional path to persist the learned codebook (.cbm or .json)
+        #[arg(long, value_name = "PATH")]
+        save_codebook: Option<PathBuf>,
     },
 
     /// Run a parameter sweep evaluation against a learned codebook
@@ -136,6 +144,7 @@ fn main() -> Result<()> {
             beta,
             lambda,
             epsilon,
+            save_codebook,
         } => {
             process_video(
                 input,
@@ -145,6 +154,7 @@ fn main() -> Result<()> {
                 beta,
                 lambda,
                 epsilon,
+                save_codebook,
             )
         }
         Commands::ProcessFolder {
@@ -155,6 +165,7 @@ fn main() -> Result<()> {
             beta,
             lambda,
             epsilon,
+            save_codebook,
         } => process_folder(
             input,
             output,
@@ -163,6 +174,7 @@ fn main() -> Result<()> {
             beta,
             lambda,
             epsilon,
+            save_codebook,
         ),
         Commands::Evaluate {
             codebook,
@@ -198,6 +210,7 @@ fn process_video(
     beta: f32,
     lambda: f32,
     epsilon: f32,
+    save_codebook: Option<PathBuf>,
 ) -> Result<()> {
     // Validate input file exists
     if !input.exists() {
@@ -248,6 +261,11 @@ fn process_video(
     println!("  - Average time per frame: {:.2}ms", stats.avg_processing_time * 1000.0);
     println!("  - Output saved to: {}", output_str);
 
+    if let Some(path) = save_codebook {
+        save_codebook_to_path(&processor.model, &path)?;
+        println!("Saved codebook to {}", path.display());
+    }
+
     Ok(())
 }
 
@@ -288,6 +306,7 @@ fn process_folder(
     beta: f32,
     lambda: f32,
     epsilon: f32,
+    save_codebook: Option<PathBuf>,
 ) -> Result<()> {
     // Validate input folder exists
     if !input.exists() {
@@ -344,6 +363,39 @@ fn process_folder(
     println!("  - Average time per frame: {:.2}ms", stats.avg_processing_time * 1000.0);
     if let Some(out) = output_str {
         println!("  - Output saved to: {}", out);
+    }
+
+    if let Some(path) = save_codebook {
+        save_codebook_to_path(&processor.model, &path)?;
+        println!("Saved codebook to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn save_codebook_to_path(model: &CodebookModel, path: &PathBuf) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create directory {}", parent.display())
+            })?;
+        }
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .unwrap_or_else(|| "".to_string());
+
+    if extension == "json" {
+        model
+            .save_to_json(path)
+            .map_err(|e| anyhow::anyhow!("Failed to save JSON codebook: {}", e))?;
+    } else {
+        model
+            .save_to_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to save binary codebook: {}", e))?;
     }
 
     Ok(())
