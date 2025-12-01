@@ -119,6 +119,12 @@ pub struct SegmentationQuality {
     pub fragmentation_score: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SuperpixelLabels {
+    pub labels: Vec<i32>,
+    pub num_superpixels: usize,
+}
+
 pub fn load_truth_masks_from_folder<P: AsRef<Path>>(
     folder: P,
     width: usize,
@@ -494,6 +500,100 @@ fn calculate_compactness(component: &Vec<usize>, width: usize, height: usize) ->
     (4.0 * std::f32::consts::PI * area) / (perimeter as f32 * perimeter as f32)
 }
 
+fn precompute_superpixel_labels(
+    frame: &Mat,
+    width: usize,
+    height: usize,
+) -> EvaluationResult<SuperpixelLabels> {
+    if frame.cols() as usize != width || frame.rows() as usize != height {
+        return Err(EvaluationError::DimensionMismatch {
+            expected: width * height,
+            actual: (frame.cols() * frame.rows()) as usize,
+            context: "frame dimensions for superpixel precomputation",
+        });
+    }
+
+    let region_size = 20;
+    let ruler = 10.0;
+
+    let mut slic = opencv::ximgproc::create_superpixel_slic(
+        frame,
+        opencv::ximgproc::SLIC,
+        region_size,
+        ruler,
+    )?;
+
+    slic.iterate(10)?;
+
+    let mut labels_mat = Mat::default();
+    slic.get_labels(&mut labels_mat)?;
+
+    let num_superpixels = slic.get_number_of_superpixels()? as usize;
+
+    let mut labels = Vec::with_capacity(width * height);
+    for row in 0..height {
+        for col in 0..width {
+            let label = *labels_mat.at_2d::<i32>(row as i32, col as i32)?;
+            labels.push(label);
+        }
+    }
+
+    Ok(SuperpixelLabels {
+        labels,
+        num_superpixels,
+    })
+}
+
+fn calculate_superpixel_purity_from_labels(
+    mask: &Vec<bool>,
+    labels: &SuperpixelLabels,
+) -> f32 {
+    if labels.num_superpixels == 0 {
+        return 0.0;
+    }
+
+    let mut fg_counts = vec![0u32; labels.num_superpixels];
+    let mut bg_counts = vec![0u32; labels.num_superpixels];
+
+    for (idx, &label) in labels.labels.iter().enumerate() {
+        if label < 0 {
+            continue;
+        }
+        let label_idx = label as usize;
+        if label_idx >= labels.num_superpixels || idx >= mask.len() {
+            continue;
+        }
+        if mask[idx] {
+            fg_counts[label_idx] += 1;
+        } else {
+            bg_counts[label_idx] += 1;
+        }
+    }
+
+    let mut pure_superpixels = 0u32;
+    let mut total_superpixels = 0u32;
+
+    for i in 0..labels.num_superpixels {
+        let fg = fg_counts[i];
+        let bg = bg_counts[i];
+        let total = fg + bg;
+        if total == 0 {
+            continue;
+        }
+        total_superpixels += 1;
+        let purity = fg.max(bg) as f32 / total as f32;
+        if purity > 0.9 {
+            pure_superpixels += 1;
+        }
+    }
+
+    if total_superpixels == 0 {
+        0.0
+    } else {
+        pure_superpixels as f32 / total_superpixels as f32
+    }
+}
+
 /// Calculate actual superpixel purity using SLIC algorithm
 /// Returns purity score (0.0-1.0) where higher means better segmentation
 fn calculate_superpixel_purity(
@@ -610,12 +710,15 @@ fn calculate_superpixel_purity(
 /// Compute a full QualityEvaluation using segmentation results, ground truth, and all metrics.
 /// This is a static function and expects frame size and a sample frame for spatial metrics.
 /// `frames` is a vector of grayscale frames (Array2<u8>) corresponding to each mask.
+/// `superpixel_labels` allows callers to reuse precomputed SLIC labels so that sweeps don't
+/// rerun expensive superpixel extraction on every parameter combination.
 pub fn compute_quality_evaluation(
     segmentation_results: &[Vec<bool>],
     truth_masks: &[Vec<bool>],
     frames: &[Array2<u8>],
     width: usize,
     height: usize,
+    superpixel_labels: Option<&[SuperpixelLabels]>,
 ) -> EvaluationResult<QualityEvaluation> {
     if segmentation_results.is_empty() {
         return Err(EvaluationError::EmptyInput("segmentation results"));
@@ -847,12 +950,42 @@ pub fn compute_quality_evaluation(
         )
     };
 
-    // Superpixel purity: average over all frames/masks
-    let mut purity_sum = 0.0;
-    for i in 0..frame_count {
-        purity_sum += calculate_superpixel_purity(&frames[i], &segmentation_results[i], width, height);
+    if let Some(label_maps) = superpixel_labels {
+        if label_maps.len() != frame_count {
+            return Err(EvaluationError::FrameCountMismatch {
+                expected: frame_count,
+                actual: label_maps.len(),
+            });
+        }
+        for labels in label_maps {
+            if labels.labels.len() != expected_pixels {
+                return Err(EvaluationError::DimensionMismatch {
+                    expected: expected_pixels,
+                    actual: labels.labels.len(),
+                    context: "precomputed superpixel labels",
+                });
+            }
+        }
     }
-    let superpixel_purity = purity_sum / frame_count as f32;
+
+    // Superpixel purity: average over all frames/masks
+    let superpixel_purity = if let Some(label_maps) = superpixel_labels {
+        let mut purity_sum = 0.0;
+        for i in 0..frame_count {
+            purity_sum += calculate_superpixel_purity_from_labels(
+                &segmentation_results[i],
+                &label_maps[i],
+            );
+        }
+        purity_sum / frame_count as f32
+    } else {
+        let mut purity_sum = 0.0;
+        for i in 0..frame_count {
+            purity_sum +=
+                calculate_superpixel_purity(&frames[i], &segmentation_results[i], width, height);
+        }
+        purity_sum / frame_count as f32
+    };
 
     // Overall score (simple average of main metrics, can be customized)
     let overall_score = (f1_score
@@ -945,6 +1078,7 @@ pub fn parameter_sweep(
     let stride = config.frame_stride.max(1);
     let mut sampled_frames = Vec::new();
     let mut flattened_frames: Vec<Vec<f32>> = Vec::new();
+    let mut superpixel_labels = Vec::new();
     let mut frame_index = 0usize;
 
     video.set(videoio::CAP_PROP_POS_FRAMES, 0.0)?;
@@ -965,6 +1099,9 @@ pub fn parameter_sweep(
                 break;
             }
         }
+
+        let labels = precompute_superpixel_labels(&frame, width, height)?;
+        superpixel_labels.push(labels);
 
         let mut gray = Mat::default();
         opencv::imgproc::cvt_color(
@@ -1049,6 +1186,7 @@ pub fn parameter_sweep(
                         &sampled_frames,
                         width,
                         height,
+                        Some(&superpixel_labels),
                     )?;
 
                     let processing_time = start_time.elapsed().as_secs_f64();
