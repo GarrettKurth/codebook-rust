@@ -372,7 +372,7 @@ fn calculate_fragmentation(
     // Calculate compactness for each component
     let compactness_scores: Vec<f32> = components
         .iter()
-        .map(|component| calculate_compactness(component, width))
+        .map(|component| calculate_compactness(component, width, height))
         .collect();
 
     let avg_compactness = compactness_scores.iter().sum::<f32>() / compactness_scores.len() as f32;
@@ -455,7 +455,7 @@ fn flood_fill(
 }
 
 /// Calculate compactness of a component (4π*area / perimeter²)
-fn calculate_compactness(component: &Vec<usize>, width: usize) -> f32 {
+fn calculate_compactness(component: &Vec<usize>, width: usize, height: usize) -> f32 {
     let area = component.len() as f32;
 
     // Calculate perimeter by counting boundary pixels
@@ -475,8 +475,12 @@ fn calculate_compactness(component: &Vec<usize>, width: usize) -> f32 {
         ];
 
         for (ny, nx) in neighbors {
-            let nidx = ny * width + nx;
-            if !component_set.contains(&nidx) {
+            if ny < height && nx < width {
+                let nidx = ny * width + nx;
+                if !component_set.contains(&nidx) {
+                    perimeter += 1;
+                }
+            } else {
                 perimeter += 1;
             }
         }
